@@ -1,0 +1,187 @@
+import os, json, zipfile, tempfile, shutil
+from pathlib import Path
+import cv2
+import numpy as np
+from pdf2image import convert_from_path
+from PIL import Image
+import torch
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from paddleocr import PaddleOCR
+from paddleocr.tools.infer.utility import get_image_file_list  # pour lister les images
+import copy
+
+# ================== CONFIGURATION ==================
+ZIP_PATH = "kyc_documents.zip"          # Archive à traiter
+OUTPUT_JSON = "extracted_kyc_data.json" # Résultat final
+TEMP_DIR = tempfile.mkdtemp()
+
+# Chemin du modèle Qwen2.5-VL sur le ModelHub Domino
+QWEN_MODEL_PATH = "/domino/edv/modelhub/ModelHub-model-huggingface-Qwen/Qwen2.5-VL-7B-instruct/main"
+
+# PaddleOCR peut utiliser des modèles locaux ou les télécharger automatiquement.
+# Pour utiliser des chemins personnalisés, décommentez et adaptez les lignes ci-dessous.
+# PADDLE_DET = "/chemin/vers/det"
+# PADDLE_REC = "/chemin/vers/rec"
+# PADDLE_CLS = "/chemin/vers/cls"
+# ocr = PaddleOCR(use_angle_cls=True, lang='en', det_model_dir=PADDLE_DET, rec_model_dir=PADDLE_REC, cls_model_dir=PADDLE_CLS, use_gpu=True)
+ocr = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=True)  # téléchargement automatique si nécessaire
+
+print("Chargement de Qwen2.5-VL-7B...")
+model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    QWEN_MODEL_PATH,
+    torch_dtype=torch.float16,
+    device_map="auto"
+)
+processor = AutoProcessor.from_pretrained(QWEN_MODEL_PATH)
+print("Modèle Qwen prêt.\n")
+
+# ================== FONCTIONS ==================
+def extract_zip(zip_path, dest):
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        zf.extractall(dest)
+    return dest
+
+def pdf_to_images(pdf_path, dpi=300):
+    try:
+        pages = convert_from_path(pdf_path, dpi=dpi)
+        return [cv2.cvtColor(np.array(page), cv2.COLOR_RGB2BGR) for page in pages]
+    except Exception as e:
+        print(f"Erreur conversion PDF {pdf_path}: {e}")
+        return []
+
+def correct_orientation(image):
+    """
+    Utilise le classifieur d'angle de PaddleOCR (TextSystem) pour obtenir l'orientation.
+    Retourne l'image pivotée si nécessaire (90°, 180°, 270°).
+    """
+    from paddleocr import TextSystem
+    # Instancier un TextSystem minimal pour la classification d'angle + détection
+    # (plus fiable que d'utiliser directement le classifieur seul)
+    text_sys = TextSystem(use_angle_cls=True)
+    # Pour éviter une reconnaissance complète lourde, on peut fixer un nombre max de détections
+    # mais ça reste acceptable sur une seule image.
+    res = text_sys.detect_and_recognize(image)
+    if res and len(res) > 0 and 'cls_label' in res[0]:
+        angle = res[0]['cls_label']  # '0', '90', '180', '270'
+        if angle in ['90', '180', '270']:
+            rot = int(angle)
+            if rot == 90:
+                image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+            elif rot == 180:
+                image = cv2.rotate(image, cv2.ROTATE_180)
+            elif rot == 270:
+                image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            print(f"    ↻ Rotation corrigée de {rot}°")
+    return image
+
+def enhance_image(image_bgr):
+    """Améliore le contraste et réduit le bruit."""
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    contrasted = clahe.apply(gray)
+    denoised = cv2.bilateralFilter(contrasted, d=5, sigmaColor=50, sigmaSpace=50)
+    # Qwen attend une image en couleur (RGB), on repasse en 3 canaux
+    return cv2.cvtColor(denoised, cv2.COLOR_GRAY2BGR)
+
+def query_qwen(image_bgr, doc_type):
+    """
+    Envoie l'image prétraitée à Qwen2.5-VL et récupère le JSON structuré.
+    """
+    # Conversion BGR -> RGB -> PIL
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(image_rgb)
+
+    if doc_type == 'identite':
+        prompt = (
+            "This is an identity card or passport from any country. "
+            "Extract the following fields in JSON format. If a field is not found, set it to null. "
+            "Fields: full_name, document_number, date_of_birth (YYYY-MM-DD), date_of_expiry (YYYY-MM-DD), "
+            "nationality, gender (M/F), issuing_country. "
+            "Return only the JSON, no other text."
+        )
+    else:  # domicile
+        prompt = (
+            "This is a proof of residence document (utility bill, bank statement, etc.) from any country. "
+            "Extract the following fields in JSON. If a field is not found, set it to null. "
+            "Fields: full_name, address (full address as a single string), date_of_issue (YYYY-MM-DD), "
+            "document_type (e.g., electricity bill, bank statement). "
+            "Return only the JSON, no other text."
+        )
+
+    # Format de conversation pour Qwen2.5-VL
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": pil_img},
+                {"type": "text", "text": prompt}
+            ]
+        }
+    ]
+    # Appliquer le template
+    text_input = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[text_input], images=[pil_img], return_tensors="pt").to(model.device)
+
+    with torch.no_grad():
+        generated_ids = model.generate(**inputs, max_new_tokens=512)
+    # Supprimer les tokens d'entrée
+    output_ids = generated_ids[0][len(inputs.input_ids[0]):]
+    response_text = processor.decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+    # Nettoyage du JSON
+    response_text = response_text.strip().strip('```json').strip('```').strip()
+    try:
+        return json.loads(response_text)
+    except json.JSONDecodeError:
+        print(f"    ⚠ JSON invalide. Réponse brute : {response_text[:200]}")
+        return {"raw": response_text}
+
+# ================== BOUCLE PRINCIPALE ==================
+def process_all_clients(extracted_root):
+    all_data = {}
+    clients = [d for d in os.listdir(extracted_root) if os.path.isdir(os.path.join(extracted_root, d))]
+    clients.sort()
+    for client_id in clients:
+        client_path = os.path.join(extracted_root, client_id)
+        print(f"\n📂 Client: {client_id}")
+        client_result = {"identite": None, "domicile": None}
+
+        for doc_type, filename in [("identite", "JUSTIFICATIF IDENTITE.pdf"),
+                                   ("domicile", "JUSTIFICATIF DOMICILE.pdf")]:
+            pdf_file = os.path.join(client_path, filename)
+            if not os.path.exists(pdf_file):
+                print(f"   ❌ {filename} manquant")
+                continue
+
+            print(f"   📄 Traitement {doc_type}...")
+            images = pdf_to_images(pdf_file)
+            if not images:
+                continue
+            img = images[0]  # on prend la première page
+
+            # 1. Correction d'orientation
+            img = correct_orientation(img)
+            # 2. Amélioration de l'image
+            img = enhance_image(img)
+            # 3. Extraction par Qwen
+            extracted = query_qwen(img, doc_type)
+            client_result[doc_type] = extracted
+            print(f"      Résultat : {json.dumps(extracted, ensure_ascii=False)}")
+
+        all_data[client_id] = client_result
+    return all_data
+
+# ================== EXÉCUTION ==================
+if __name__ == "__main__":
+    print("📦 Extraction de l'archive...")
+    zip_dest = extract_zip(ZIP_PATH, TEMP_DIR)
+
+    print("🔍 Traitement des dossiers KYC...")
+    results = process_all_clients(zip_dest)
+
+    with open(OUTPUT_JSON, 'w', encoding='utf-8') as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    print(f"\n✅ Résultats enregistrés dans {OUTPUT_JSON}")
+
+    # Nettoyage
+    shutil.rmtree(TEMP_DIR)
