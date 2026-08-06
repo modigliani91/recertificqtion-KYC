@@ -1,0 +1,193 @@
+"""
+================================================================================
+ SCRIPT D'EXTRACTION DES DOCUMENTS KYC
+================================================================================
+Objectif :
+  1. Dézipper kyc_docs.zip
+  2. Parcourir chaque dossier client
+  3. Repérer uniquement les 5 fichiers PDF cibles (peu importe la casse,
+     les espaces ou les petites variations dans le nom)
+  4. Copier ces fichiers trouvés dans un dossier de sortie structuré
+     par client (utile pour l'étape suivante : OCR / extraction d'infos)
+  5. Générer un rapport CSV indiquant, pour CHAQUE client, quels documents
+     sont présents et lesquels sont manquants
+
+Aucune donnée n'est modifiée dans le zip original : on travaille toujours
+sur une copie extraite.
+================================================================================
+"""
+
+import zipfile
+import shutil
+import csv
+import re
+import unicodedata
+from pathlib import Path
+
+
+# ------------------------------------------------------------------------
+# ÉTAPE 0 - CONFIGURATION (à adapter si besoin)
+# ------------------------------------------------------------------------
+ZIP_PATH = Path("kyc_docs.zip")              # chemin vers l'archive
+EXTRACT_DIR = Path("kyc_extracted")          # dossier où tout le zip est dézippé
+OUTPUT_DIR = Path("kyc_documents_cibles")    # dossier de sortie (fichiers utiles uniquement)
+REPORT_PATH = Path("rapport_presence_kyc.csv")  # rapport final
+
+# Liste des documents recherchés (noms "logiques", sans se soucier de la casse)
+# NB : j'ai gardé "CARTON SIGNATUTE" tel quel car c'est le nom réel indiqué,
+# mais j'accepte aussi "SIGNATURE" au cas où le fichier serait mal nommé
+# dans certains dossiers. Vous pouvez retirer cette tolérance si non désiré.
+TARGET_DOCS = {
+    "JUSTIFICATIF IDENTITE": ["justificatif identite"],
+    "JUSTIFICATIF DOMICILE": ["justificatif domicile"],
+    "CONVENTION COMPTE": ["convention compte"],
+    "FATCA": ["fatca"],
+    "CARTON SIGNATURE": ["carton signatute", "carton signature"],
+}
+
+
+# ------------------------------------------------------------------------
+# ÉTAPE 1 - FONCTION DE NORMALISATION DES NOMS DE FICHIERS
+# ------------------------------------------------------------------------
+def normaliser(texte: str) -> str:
+    """
+    Met le texte en minuscule, retire les accents, la ponctuation
+    et les espaces multiples, pour pouvoir comparer les noms de fichiers
+    de façon fiable même s'ils ne sont pas parfaitement identiques.
+    """
+    texte = texte.lower()
+    texte = unicodedata.normalize("NFKD", texte).encode("ascii", "ignore").decode("utf-8")
+    texte = re.sub(r"\.pdf$", "", texte)          # retire l'extension
+    texte = re.sub(r"[^a-z0-9]+", " ", texte)      # remplace ponctuation/underscores par espace
+    texte = re.sub(r"\s+", " ", texte).strip()     # espaces multiples -> un seul
+    return texte
+
+
+# ------------------------------------------------------------------------
+# ÉTAPE 2 - DÉZIPPER L'ARCHIVE
+# ------------------------------------------------------------------------
+def dezipper(zip_path: Path, extract_dir: Path) -> None:
+    if not zip_path.exists():
+        raise FileNotFoundError(f"Archive introuvable : {zip_path}")
+
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        archive.extractall(extract_dir)
+
+    print(f"[OK] Archive dézippée dans : {extract_dir.resolve()}")
+
+
+# ------------------------------------------------------------------------
+# ÉTAPE 3 - REPÉRER LES DOSSIERS CLIENTS
+# ------------------------------------------------------------------------
+def lister_dossiers_clients(extract_dir: Path) -> list[Path]:
+    """
+    Retourne la liste des dossiers de premier niveau dans extract_dir.
+    Chaque dossier = un identifiant client.
+    Gère le cas où le zip contient un seul dossier racine englobant
+    tous les dossiers clients.
+    """
+    contenu = [p for p in extract_dir.iterdir() if p.is_dir()]
+
+    # Si le zip contient un seul dossier racine (ex: "kyc_docs/"),
+    # on descend d'un niveau pour trouver les vrais dossiers clients.
+    if len(contenu) == 1 and contenu[0].is_dir():
+        sous_contenu = [p for p in contenu[0].iterdir() if p.is_dir()]
+        if sous_contenu:
+            return sous_contenu
+
+    return contenu
+
+
+# ------------------------------------------------------------------------
+# ÉTAPE 4 - CHERCHER LES DOCUMENTS CIBLES DANS UN DOSSIER CLIENT
+# ------------------------------------------------------------------------
+def trouver_documents_cibles(dossier_client: Path) -> dict:
+    """
+    Parcourt tous les PDF du dossier client (récursivement, au cas où
+    il y aurait des sous-dossiers) et associe chaque document cible
+    au fichier trouvé correspondant (ou None si absent).
+    """
+    pdfs_du_dossier = list(dossier_client.rglob("*.pdf")) + list(dossier_client.rglob("*.PDF"))
+
+    resultats = {nom_cible: None for nom_cible in TARGET_DOCS}
+
+    for pdf in pdfs_du_dossier:
+        nom_normalise = normaliser(pdf.stem)
+        for nom_cible, variantes in TARGET_DOCS.items():
+            if resultats[nom_cible] is not None:
+                continue  # déjà trouvé
+            for variante in variantes:
+                if normaliser(variante) == nom_normalise:
+                    resultats[nom_cible] = pdf
+                    break
+
+    return resultats
+
+
+# ------------------------------------------------------------------------
+# ÉTAPE 5 - COPIER LES FICHIERS TROUVÉS DANS LE DOSSIER DE SORTIE
+# ------------------------------------------------------------------------
+def copier_documents(client_id: str, resultats: dict, output_dir: Path) -> None:
+    dossier_sortie_client = output_dir / client_id
+    dossier_sortie_client.mkdir(parents=True, exist_ok=True)
+
+    for nom_cible, chemin_source in resultats.items():
+        if chemin_source is not None:
+            nom_fichier_sortie = f"{nom_cible}.pdf"
+            shutil.copy2(chemin_source, dossier_sortie_client / nom_fichier_sortie)
+
+
+# ------------------------------------------------------------------------
+# ÉTAPE 6 - FONCTION PRINCIPALE
+# ------------------------------------------------------------------------
+def main():
+    # 1. Dézipper
+    dezipper(ZIP_PATH, EXTRACT_DIR)
+
+    # 2. Lister les dossiers clients
+    dossiers_clients = lister_dossiers_clients(EXTRACT_DIR)
+    print(f"[INFO] {len(dossiers_clients)} dossier(s) client trouvé(s).")
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    lignes_rapport = []
+    noms_colonnes = ["client_id"] + list(TARGET_DOCS.keys()) + ["documents_manquants"]
+
+    # 3. Traiter chaque dossier client
+    for dossier in sorted(dossiers_clients):
+        client_id = dossier.name
+        resultats = trouver_documents_cibles(dossier)
+
+        # Copier les fichiers trouvés
+        copier_documents(client_id, resultats, OUTPUT_DIR)
+
+        # Construire la ligne du rapport
+        ligne = {"client_id": client_id}
+        manquants = []
+        for nom_cible in TARGET_DOCS:
+            present = resultats[nom_cible] is not None
+            ligne[nom_cible] = "Oui" if present else "Non"
+            if not present:
+                manquants.append(nom_cible)
+        ligne["documents_manquants"] = ", ".join(manquants) if manquants else "Aucun"
+
+        lignes_rapport.append(ligne)
+
+    # 4. Écrire le rapport CSV
+    with open(REPORT_PATH, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=noms_colonnes, delimiter=";")
+        writer.writeheader()
+        writer.writerows(lignes_rapport)
+
+    print(f"[OK] Rapport généré : {REPORT_PATH.resolve()}")
+    print(f"[OK] Documents extraits dans : {OUTPUT_DIR.resolve()}")
+
+    # 5. Résumé rapide en console
+    total = len(lignes_rapport)
+    complets = sum(1 for l in lignes_rapport if l["documents_manquants"] == "Aucun")
+    print(f"[RÉSUMÉ] {complets}/{total} dossiers clients ont les 5 documents complets.")
+
+
+if __name__ == "__main__":
+    main()
