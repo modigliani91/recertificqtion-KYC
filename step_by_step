@@ -191,3 +191,430 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""
+================================================================================
+ EXTRACTION D'INFORMATION - JUSTIFICATIF IDENTITE.PDF
+================================================================================
+Pré-requis (à installer dans l'environnement Domino) :
+    pip install pymupdf pillow pytesseract mrz transformers torch
+    + le paquet système tesseract-ocr avec les langues fra + ara :
+        apt-get install tesseract-ocr tesseract-ocr-fra tesseract-ocr-ara
+
+Ce script :
+  1. Parcourt chaque dossier client dans kyc_documents_cibles/ (généré par
+     le script précédent)
+  2. Convertit JUSTIFICATIF IDENTITE.PDF (multi-pages) en images
+  3. Lance l'OCR bilingue (arabe + français) via le VLM PaddleOCR-VL local
+  4. Détecte : type de document (CNI / permis de conduire / passeport),
+     nationalité algérienne, et présence de la MRZ (document biométrique)
+  5. Utilise une approche hybride pour la MRZ :
+       - lecture du texte MRZ via le VLM (regex sur les lignes)
+       - lecture du texte MRZ via une bande image dédiée + Tesseract
+       - les deux se recoupent / se valident mutuellement
+  6. Parse les champs de la MRZ (règles TD1 pour CNI, TD3 pour passeport)
+     et traduit les libellés en français
+  7. Génère deux rapports :
+       - rapport_extraction_identite.csv  -> détail complet par client
+       - rapport_mrz_clients.csv          -> qui a une MRZ extraite ou pas
+================================================================================
+"""
+
+import re
+import csv
+import json
+import unicodedata
+from pathlib import Path
+from dataclasses import dataclass, field, asdict
+
+import fitz  # PyMuPDF
+from PIL import Image
+import pytesseract
+
+
+# ------------------------------------------------------------------------
+# ÉTAPE 0 - CONFIGURATION
+# ------------------------------------------------------------------------
+DOCUMENTS_DIR = Path("kyc_documents_cibles")          # sortie du script précédent
+NOM_FICHIER_IDENTITE = "JUSTIFICATIF IDENTITE.pdf"
+RAPPORT_DETAIL = Path("rapport_extraction_identite.csv")
+RAPPORT_MRZ = Path("rapport_mrz_clients.csv")
+
+PADDLEOCR_VL_PATH = "/domino/edv/modelhub/ModelHub-model-huggingface-PaddlePaddle/PaddleOCR-VL/main"
+
+DPI_CONVERSION = 300  # résolution de rendu des pages PDF -> image
+
+
+# ------------------------------------------------------------------------
+# ÉTAPE 1 - CHARGEMENT DU MODÈLE VLM PADDLEOCR-VL (local, chargé une seule fois)
+# ------------------------------------------------------------------------
+_MODEL_CACHE = {}
+
+def get_paddleocr_vl():
+    """
+    Charge le modèle une seule fois (singleton) pour éviter de le recharger
+    à chaque appel.
+    ATTENTION : l'API exacte (AutoModel/AutoProcessor vs API maison
+    PaddleOCR-VL) dépend de la façon dont le modèle est packagé sur votre
+    ModelHub. Vérifiez le README du dossier du modèle et adaptez si besoin.
+    """
+    if "model" not in _MODEL_CACHE:
+        from transformers import AutoModel, AutoProcessor
+        processor = AutoProcessor.from_pretrained(PADDLEOCR_VL_PATH, trust_remote_code=True)
+        model = AutoModel.from_pretrained(PADDLEOCR_VL_PATH, trust_remote_code=True)
+        model.eval()
+        _MODEL_CACHE["model"] = model
+        _MODEL_CACHE["processor"] = processor
+    return _MODEL_CACHE["processor"], _MODEL_CACHE["model"]
+
+
+def ocr_vlm(image: Image.Image) -> str:
+    """
+    Lance l'OCR sur une image via le VLM. Le prompt demande explicitement
+    de restituer le texte tel quel (bilingue arabe/français), sans traduire,
+    car on a besoin du texte brut pour la détection de mots-clés dans les
+    deux langues.
+    """
+    processor, model = get_paddleocr_vl()
+    prompt = "Extrait tout le texte visible sur ce document, tel quel, sans le traduire."
+    inputs = processor(images=image, text=prompt, return_tensors="pt")
+    sortie = model.generate(**inputs, max_new_tokens=2048)
+    texte = processor.batch_decode(sortie, skip_special_tokens=True)[0]
+    return texte
+
+
+# ------------------------------------------------------------------------
+# ÉTAPE 2 - CONVERSION PDF -> IMAGES (une image par page)
+# ------------------------------------------------------------------------
+def pdf_vers_images(pdf_path: Path, dpi: int = DPI_CONVERSION) -> list[Image.Image]:
+    doc = fitz.open(pdf_path)
+    zoom = dpi / 72
+    matrice = fitz.Matrix(zoom, zoom)
+    images = []
+    for page in doc:
+        pix = page.get_pixmap(matrix=matrice)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        images.append(img)
+    doc.close()
+    return images
+
+
+# ------------------------------------------------------------------------
+# ÉTAPE 3 - NORMALISATION DE TEXTE POUR RECHERCHE DE MOTS-CLÉS BILINGUES
+# ------------------------------------------------------------------------
+def normaliser_recherche(texte: str) -> str:
+    """
+    Minuscules + suppression des diacritiques (accents latins ET tachkil
+    arabe, qui sont techniquement des caractères combinants Unicode).
+    Permet de matcher "Algérienne"/"algerienne" et le arabe avec ou sans
+    voyellation.
+    """
+    texte = texte.lower()
+    texte = unicodedata.normalize("NFKD", texte)
+    texte = "".join(c for c in texte if not unicodedata.combining(c))
+    return texte
+
+
+def contient_un_des_mots_cles(texte_normalise: str, mots_cles: list[str]) -> bool:
+    for mot in mots_cles:
+        if normaliser_recherche(mot) in texte_normalise:
+            return True
+    return False
+
+
+# Mots-clés bilingues (français + arabe) pour chaque type de document
+MOTS_CLES_TYPE_DOCUMENT = {
+    "Carte Nationale d'Identite": [
+        "carte nationale d'identite", "carte d'identite", "cni",
+        "بطاقة التعريف الوطنية", "بطاقة تعريف وطنية",
+    ],
+    "Permis de Conduire": [
+        "permis de conduire",
+        "رخصة السياقة", "رخصة سياقة",
+    ],
+    "Passeport": [
+        "passeport",
+        "جواز سفر", "جواز السفر",
+    ],
+}
+
+MOTS_CLES_ALGERIE = [
+    "republique algerienne democratique et populaire",
+    "الجمهورية الجزائرية الديمقراطية الشعبية",
+    "algerienne", "algerien", "الجزائر", "جزائرية", "جزائري",
+]
+
+
+def detecter_type_document(texte_ocr: str) -> str:
+    texte_norm = normaliser_recherche(texte_ocr)
+    for type_doc, mots_cles in MOTS_CLES_TYPE_DOCUMENT.items():
+        if contient_un_des_mots_cles(texte_norm, mots_cles):
+            return type_doc
+    return "Indetermine"
+
+
+def detecter_document_algerien(texte_ocr: str) -> bool:
+    texte_norm = normaliser_recherche(texte_ocr)
+    return contient_un_des_mots_cles(texte_norm, MOTS_CLES_ALGERIE)
+
+
+# ------------------------------------------------------------------------
+# ÉTAPE 4 - DÉTECTION MRZ - APPROCHE 1 : via le texte OCR du VLM (regex)
+# ------------------------------------------------------------------------
+# Une ligne MRZ ne contient que des majuscules, chiffres et '<', et fait
+# généralement 30 caractères (format TD1 - cartes/CNI) ou 44 (TD3 - passeport)
+MRZ_LIGNE_PATTERN = re.compile(r'^[A-Z0-9<]{28,44}$')
+
+def detecter_lignes_mrz_dans_texte(texte_ocr: str) -> list[str]:
+    lignes_brutes = [l.strip().upper().replace(" ", "") for l in texte_ocr.splitlines()]
+    lignes_mrz = [l for l in lignes_brutes if MRZ_LIGNE_PATTERN.match(l) and l.count("<") >= 2]
+    return lignes_mrz
+
+
+# ------------------------------------------------------------------------
+# ÉTAPE 5 - DÉTECTION MRZ - APPROCHE 2 : bande image dédiée + Tesseract
+# ------------------------------------------------------------------------
+def extraire_bande_mrz(image: Image.Image) -> Image.Image:
+    """La MRZ se trouve généralement dans les ~25% inférieurs du document."""
+    largeur, hauteur = image.size
+    haut = int(hauteur * 0.75)
+    return image.crop((0, haut, largeur, hauteur))
+
+
+def ocr_bande_mrz_tesseract(bande: Image.Image) -> list[str]:
+    config = "--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"
+    texte = pytesseract.image_to_string(bande, config=config, lang="eng")
+    lignes_brutes = [l.strip().upper().replace(" ", "") for l in texte.splitlines() if l.strip()]
+    lignes_valides = [l for l in lignes_brutes if MRZ_LIGNE_PATTERN.match(l)]
+    return lignes_valides
+
+
+# ------------------------------------------------------------------------
+# ÉTAPE 6 - EXTRACTION MRZ HYBRIDE (les deux méthodes se recoupent)
+# ------------------------------------------------------------------------
+def extraire_mrz_hybride(image: Image.Image, texte_ocr_vlm: str) -> tuple[list[str], str]:
+    lignes_vlm = detecter_lignes_mrz_dans_texte(texte_ocr_vlm)
+    bande = extraire_bande_mrz(image)
+    lignes_lib = ocr_bande_mrz_tesseract(bande)
+
+    if lignes_vlm and lignes_lib:
+        # Les deux méthodes ont trouvé quelque chose : on croise les résultats.
+        # On retient la source qui donne un nombre de lignes cohérent avec un
+        # format MRZ standard (2 ou 3 lignes), en priorisant le VLM si les deux
+        # sont valides (généralement plus fiable sur du texte mixte).
+        if len(lignes_vlm) in (2, 3):
+            return lignes_vlm, "VLM + Bibliotheque MRZ (recoupement, VLM retenu)"
+        elif len(lignes_lib) in (2, 3):
+            return lignes_lib, "VLM + Bibliotheque MRZ (recoupement, Bibliotheque retenue)"
+        else:
+            return lignes_vlm, "VLM + Bibliotheque MRZ (recoupement partiel)"
+    elif lignes_vlm:
+        return lignes_vlm, "VLM uniquement"
+    elif lignes_lib:
+        return lignes_lib, "Bibliotheque MRZ uniquement"
+    else:
+        return [], "Aucune"
+
+
+# ------------------------------------------------------------------------
+# ÉTAPE 7 - PARSING DES CHAMPS MRZ (règles TD1 pour CNI, TD3 pour passeport)
+# ------------------------------------------------------------------------
+def formater_date_mrz(date_aaMMjj: str) -> str:
+    """Convertit une date MRZ 'AAMMJJ' en 'JJ/MM/AAAA' (heuristique < 30 = 20xx)."""
+    if not date_aaMMjj or len(date_aaMMjj) != 6 or not date_aaMMjj.isdigit():
+        return ""
+    aa, mm, jj = date_aaMMjj[0:2], date_aaMMjj[2:4], date_aaMMjj[4:6]
+    siecle = "20" if int(aa) <= 30 else "19"
+    return f"{jj}/{mm}/{siecle}{aa}"
+
+
+def traduire_sexe(code_sexe: str) -> str:
+    return {"M": "Masculin", "F": "Feminin"}.get(code_sexe, "Indetermine")
+
+
+def parser_mrz(lignes: list[str]) -> dict:
+    """
+    Parse les lignes MRZ selon le format détecté (TD1 = 3 lignes / CNI,
+    TD3 = 2 lignes / passeport) et restitue les champs en français.
+
+    NOTE : l'API du package `mrz` (TD1CodeChecker / TD3CodeChecker,
+    et les noms d'attributs sur `.fields()`) est à vérifier contre la
+    version installée dans votre environnement - ajustez si nécessaire.
+    """
+    try:
+        if len(lignes) == 3 and all(len(l) >= 28 for l in lignes):
+            from mrz.checker.td1 import TD1CodeChecker
+            texte_mrz = "\n".join(l[:30].ljust(30, "<") for l in lignes)
+            checker = TD1CodeChecker(texte_mrz)
+            champs = checker.fields()
+            format_mrz = "TD1 (carte d'identite)"
+        elif len(lignes) == 2 and all(len(l) >= 40 for l in lignes):
+            from mrz.checker.td3 import TD3CodeChecker
+            texte_mrz = "\n".join(l[:44].ljust(44, "<") for l in lignes)
+            checker = TD3CodeChecker(texte_mrz)
+            champs = checker.fields()
+            format_mrz = "TD3 (passeport)"
+        else:
+            return {"erreur_parsing_mrz": f"Nombre/longueur de lignes inattendu ({len(lignes)})"}
+
+        return {
+            "format_mrz": format_mrz,
+            "mrz_valide": bool(checker),
+            "nom": getattr(champs, "surname", ""),
+            "prenom": getattr(champs, "name", ""),
+            "numero_document": getattr(champs, "document_number", ""),
+            "date_naissance": formater_date_mrz(getattr(champs, "birth_date", "")),
+            "sexe": traduire_sexe(getattr(champs, "sex", "")),
+            "date_expiration": formater_date_mrz(getattr(champs, "expiry_date", "")),
+            "nationalite": getattr(champs, "nationality", ""),
+            "pays_emetteur": getattr(champs, "country", ""),
+        }
+    except Exception as e:
+        return {"erreur_parsing_mrz": str(e)}
+
+
+# ------------------------------------------------------------------------
+# ÉTAPE 8 - STRUCTURE DE RÉSULTAT PAR CLIENT
+# ------------------------------------------------------------------------
+@dataclass
+class ResultatIdentite:
+    client_id: str
+    fichier_trouve: bool = False
+    nb_pages: int = 0
+    type_document: str = "Non traite"
+    document_algerien: str = "Indetermine"
+    biometrique: str = "Non"
+    mrz_detectee: str = "Non"
+    methode_mrz: str = "Aucune"
+    mrz_brute: str = ""
+    informations_mrz: dict = field(default_factory=dict)
+    erreur: str = ""
+
+
+# ------------------------------------------------------------------------
+# ÉTAPE 9 - TRAITEMENT D'UN CLIENT
+# ------------------------------------------------------------------------
+def traiter_client(dossier_client: Path) -> ResultatIdentite:
+    client_id = dossier_client.name
+    resultat = ResultatIdentite(client_id=client_id)
+
+    pdf_path = dossier_client / NOM_FICHIER_IDENTITE
+    if not pdf_path.exists():
+        resultat.erreur = "JUSTIFICATIF IDENTITE.pdf absent de ce dossier"
+        return resultat
+
+    resultat.fichier_trouve = True
+
+    try:
+        images = pdf_vers_images(pdf_path)
+        resultat.nb_pages = len(images)
+
+        texte_toutes_pages = []
+        lignes_mrz_trouvees: list[str] = []
+        methode_mrz_retenue = "Aucune"
+
+        # On parcourt les pages : on cumule le texte pour la détection du
+        # type de document, et on cherche la MRZ page par page (on s'arrête
+        # dès qu'on la trouve, car elle n'apparaît que sur une seule page).
+        for image in images:
+            texte_page = ocr_vlm(image)
+            texte_toutes_pages.append(texte_page)
+
+            if not lignes_mrz_trouvees:
+                lignes, methode = extraire_mrz_hybride(image, texte_page)
+                if lignes:
+                    lignes_mrz_trouvees = lignes
+                    methode_mrz_retenue = methode
+
+        texte_complet = "\n".join(texte_toutes_pages)
+
+        # Détection du type de document et de la nationalité
+        resultat.type_document = detecter_type_document(texte_complet)
+        resultat.document_algerien = "Oui" if detecter_document_algerien(texte_complet) else "Non"
+
+        # MRZ -> document biométrique
+        if lignes_mrz_trouvees:
+            resultat.mrz_detectee = "Oui"
+            resultat.methode_mrz = methode_mrz_retenue
+            resultat.mrz_brute = " | ".join(lignes_mrz_trouvees)
+            resultat.biometrique = "Oui"
+            resultat.informations_mrz = parser_mrz(lignes_mrz_trouvees)
+        else:
+            resultat.mrz_detectee = "Non"
+            resultat.methode_mrz = "Aucune"
+            resultat.biometrique = "Non"
+
+    except Exception as e:
+        resultat.erreur = f"Erreur de traitement : {e}"
+
+    return resultat
+
+
+# ------------------------------------------------------------------------
+# ÉTAPE 10 - FONCTION PRINCIPALE : parcourt tous les clients, écrit les rapports
+# ------------------------------------------------------------------------
+def main():
+    dossiers_clients = sorted([p for p in DOCUMENTS_DIR.iterdir() if p.is_dir()])
+    print(f"[INFO] {len(dossiers_clients)} dossier(s) client à traiter.")
+
+    resultats = []
+    for dossier in dossiers_clients:
+        print(f"[TRAITEMENT] {dossier.name} ...")
+        resultats.append(traiter_client(dossier))
+
+    # --- Rapport détaillé complet ---
+    with open(RAPPORT_DETAIL, "w", newline="", encoding="utf-8-sig") as f:
+        colonnes = [
+            "client_id", "fichier_trouve", "nb_pages", "type_document",
+            "document_algerien", "biometrique", "mrz_detectee", "methode_mrz",
+            "mrz_brute", "informations_mrz", "erreur",
+        ]
+        writer = csv.DictWriter(f, fieldnames=colonnes, delimiter=";")
+        writer.writeheader()
+        for r in resultats:
+            ligne = asdict(r)
+            ligne["informations_mrz"] = json.dumps(r.informations_mrz, ensure_ascii=False)
+            writer.writerow(ligne)
+
+    # --- Rapport dédié MRZ : qui a une MRZ extraite, qui n'en a pas ---
+    with open(RAPPORT_MRZ, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f, delimiter=";")
+        writer.writerow(["client_id", "mrz_detectee", "methode_mrz", "type_document", "raison_absence"])
+        for r in resultats:
+            raison = ""
+            if r.mrz_detectee != "Oui":
+                if not r.fichier_trouve:
+                    raison = "Fichier JUSTIFICATIF IDENTITE.pdf absent"
+                elif r.erreur:
+                    raison = r.erreur
+                elif r.type_document == "Permis de Conduire":
+                    raison = "Document generalement non biometrique"
+                else:
+                    raison = "MRZ non detectee sur le scan (qualite image / document ancien format)"
+            writer.writerow([r.client_id, r.mrz_detectee, r.methode_mrz, r.type_document, raison])
+
+    # --- Résumé console ---
+    total = len(resultats)
+    avec_mrz = sum(1 for r in resultats if r.mrz_detectee == "Oui")
+    sans_mrz = total - avec_mrz
+    print(f"[OK] Rapport détaillé : {RAPPORT_DETAIL.resolve()}")
+    print(f"[OK] Rapport MRZ      : {RAPPORT_MRZ.resolve()}")
+    print(f"[RÉSUMÉ] {avec_mrz}/{total} clients avec MRZ extraite, {sans_mrz}/{total} sans MRZ.")
+
+
+if __name__ == "__main__":
+    main()
