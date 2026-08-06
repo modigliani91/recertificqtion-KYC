@@ -1,0 +1,622 @@
+"""
+================================================================================
+ ETAPE 1 - PREPARATION DES DOSSIERS KYC
+================================================================================
+1. Dezippe kyc_docs.zip
+2. Pour chaque dossier client, verifie la presence des 5 documents requis
+3. IMPORTANT (nouveau comportement) : ne copie dans kyc_documents_cibles/ que
+   les dossiers clients COMPLETS (les 5 documents presents). Les dossiers
+   incomplets ne sont PAS copies, mais restent tracés dans le rapport pour
+   audit / relance client.
+4. Genere rapport_presence_kyc.csv : statut de CHAQUE client (complet/incomplet
+   + liste des documents manquants)
+================================================================================
+"""
+
+import zipfile
+import shutil
+import csv
+import re
+import unicodedata
+from pathlib import Path
+
+
+# ------------------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------------------
+ZIP_PATH = Path("kyc_docs.zip")
+EXTRACT_DIR = Path("kyc_extracted")
+OUTPUT_DIR = Path("kyc_documents_cibles")           # ne contiendra QUE les dossiers complets
+REPORT_PATH = Path("rapport_presence_kyc.csv")
+
+TARGET_DOCS = {
+    "JUSTIFICATIF IDENTITE": ["justificatif identite"],
+    "JUSTIFICATIF DOMICILE": ["justificatif domicile"],
+    "CONVENTION COMPTE": ["convention compte"],
+    "FATCA": ["fatca"],
+    "CARTON SIGNATURE": ["carton signatute", "carton signature"],
+}
+
+
+def normaliser(texte: str) -> str:
+    texte = texte.lower()
+    texte = unicodedata.normalize("NFKD", texte).encode("ascii", "ignore").decode("utf-8")
+    texte = re.sub(r"\.pdf$", "", texte)
+    texte = re.sub(r"[^a-z0-9]+", " ", texte)
+    texte = re.sub(r"\s+", " ", texte).strip()
+    return texte
+
+
+def dezipper(zip_path: Path, extract_dir: Path) -> None:
+    if not zip_path.exists():
+        raise FileNotFoundError(f"Archive introuvable : {zip_path}")
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        archive.extractall(extract_dir)
+    print(f"[OK] Archive dezippee dans : {extract_dir.resolve()}")
+
+
+def lister_dossiers_clients(extract_dir: Path) -> list[Path]:
+    contenu = [p for p in extract_dir.iterdir() if p.is_dir()]
+    if len(contenu) == 1 and contenu[0].is_dir():
+        sous_contenu = [p for p in contenu[0].iterdir() if p.is_dir()]
+        if sous_contenu:
+            return sous_contenu
+    return contenu
+
+
+def trouver_documents_cibles(dossier_client: Path) -> dict:
+    pdfs = list(dossier_client.rglob("*.pdf")) + list(dossier_client.rglob("*.PDF"))
+    resultats = {nom: None for nom in TARGET_DOCS}
+    for pdf in pdfs:
+        nom_normalise = normaliser(pdf.stem)
+        for nom_cible, variantes in TARGET_DOCS.items():
+            if resultats[nom_cible] is not None:
+                continue
+            if any(normaliser(v) == nom_normalise for v in variantes):
+                resultats[nom_cible] = pdf
+    return resultats
+
+
+def copier_documents(client_id: str, resultats: dict, output_dir: Path) -> None:
+    dossier_sortie = output_dir / client_id
+    dossier_sortie.mkdir(parents=True, exist_ok=True)
+    for nom_cible, chemin_source in resultats.items():
+        shutil.copy2(chemin_source, dossier_sortie / f"{nom_cible}.pdf")
+
+
+def main():
+    dezipper(ZIP_PATH, EXTRACT_DIR)
+    dossiers_clients = lister_dossiers_clients(EXTRACT_DIR)
+    print(f"[INFO] {len(dossiers_clients)} dossier(s) client trouve(s).")
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    lignes_rapport = []
+    noms_colonnes = ["client_id", "statut"] + list(TARGET_DOCS.keys()) + ["documents_manquants"]
+
+    nb_complets = 0
+    for dossier in sorted(dossiers_clients):
+        client_id = dossier.name
+        resultats = trouver_documents_cibles(dossier)
+
+        manquants = [nom for nom, chemin in resultats.items() if chemin is None]
+        est_complet = len(manquants) == 0
+
+        # --- LE POINT IMPORTANT : on ne copie QUE si le dossier est complet ---
+        if est_complet:
+            copier_documents(client_id, resultats, OUTPUT_DIR)
+            nb_complets += 1
+
+        ligne = {"client_id": client_id, "statut": "Complet" if est_complet else "Incomplet"}
+        for nom in TARGET_DOCS:
+            ligne[nom] = "Oui" if resultats[nom] is not None else "Non"
+        ligne["documents_manquants"] = ", ".join(manquants) if manquants else "Aucun"
+        lignes_rapport.append(ligne)
+
+    with open(REPORT_PATH, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=noms_colonnes, delimiter=";")
+        writer.writeheader()
+        writer.writerows(lignes_rapport)
+
+    total = len(lignes_rapport)
+    print(f"[OK] Rapport genere : {REPORT_PATH.resolve()}")
+    print(f"[OK] Dossiers copies dans {OUTPUT_DIR.resolve()} (uniquement les complets)")
+    print(f"[RESUME] {nb_complets}/{total} dossiers clients complets et disponibles pour la suite du traitement.")
+    print(f"[RESUME] {total - nb_complets}/{total} dossiers incomplets -> NON copies, voir rapport pour relance.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+"""
+================================================================================
+ ETAPE 2 - EXTRACTION D'INFORMATION - JUSTIFICATIF IDENTITE.PDF
+================================================================================
+Pre-requis :
+    pip install -U transformers einops pymupdf pillow pytesseract mrz opencv-python-headless
+    apt-get install tesseract-ocr tesseract-ocr-fra tesseract-ocr-ara
+
+Ce script reprend l'implementation precedente en corrigeant 2 problemes reels :
+
+  A) "Aucune MRZ detectee" sur des documents qui en ont pourtant une.
+     Causes les plus frequentes, dans l'ordre de probabilite :
+       1. La CNI biometrique algerienne porte sa MRZ au VERSO de la carte.
+          Si le scan du recto est mis avant/au lieu du verso, ou si le verso
+          est mal cadre, la MRZ n'est simplement jamais dans le champ scanne
+          sur cette page -> il faut bien parcourir TOUTES les pages (deja
+          fait), et le pre-traitement doit fiabiliser la lecture du verso.
+       2. Mauvaise rotation du scan (page a 90/180/270°, ou legerement
+          inclinee) : un texte a l'envers n'est reconnu ni par le VLM ni
+          par Tesseract -> ajout d'une correction de rotation automatique.
+       3. Mauvaise qualite d'image (contraste faible, bruit, flou de scan) ->
+          ajout d'un rehaussement (CLAHE + debruitage + nettete) avant OCR,
+          et d'un traitement dedie (upscale + binarisation) pour la bande MRZ
+          qui est en tres petits caracteres.
+       4. La zone de recherche de la bande MRZ (bas de l'image) etait fixe a
+          25% -> le script tente maintenant plusieurs decoupes (25/35/45%)
+          pour absorber les marges de scan variables.
+
+  B) Erreurs au chargement du modele PaddleOCR-VL :
+       - "No module named 'einops'"            -> dependance manquante
+       - "Unrecognized keys in 'rope_parameters' for 'rope_type'='default'"
+         -> incompatibilite entre la version de 'transformers' installee et
+            le format de configuration attendu par le modele (le champ
+            'rope_scaling' a change de schema entre versions de transformers)
+     Le script detecte ces erreurs specifiquement et affiche un message
+     explicite avec la marche a suivre, au lieu de planter sans explication.
+================================================================================
+"""
+
+import re
+import csv
+import json
+import unicodedata
+from pathlib import Path
+from dataclasses import dataclass, field, asdict
+
+import numpy as np
+import cv2
+import fitz  # PyMuPDF
+from PIL import Image
+import pytesseract
+
+
+# ------------------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------------------
+DOCUMENTS_DIR = Path("kyc_documents_cibles")   # ne contient QUE les dossiers complets (etape 1)
+NOM_FICHIER_IDENTITE = "JUSTIFICATIF IDENTITE.pdf"
+RAPPORT_DETAIL = Path("rapport_extraction_identite.csv")
+RAPPORT_MRZ = Path("rapport_mrz_clients.csv")
+
+PADDLEOCR_VL_PATH = "/domino/edv/modelhub/ModelHub-model-huggingface-PaddlePaddle/PaddleOCR-VL/main"
+
+DPI_CONVERSION = 300
+SAUVEGARDER_IMAGES_DEBUG = False   # True pour inspecter les images pretraitees en cas de doute
+DOSSIER_DEBUG = Path("debug_images")
+
+
+# ==========================================================================
+# PARTIE A - CHARGEMENT ROBUSTE DU MODELE VLM (avec messages d'erreur clairs)
+# ==========================================================================
+_MODEL_CACHE = {}
+
+def get_paddleocr_vl():
+    if "model" in _MODEL_CACHE:
+        return _MODEL_CACHE["processor"], _MODEL_CACHE["model"]
+
+    try:
+        from transformers import AutoModel, AutoProcessor
+    except ImportError as e:
+        raise ImportError(
+            "Le module 'transformers' est manquant.\nInstallez-le avec : pip install -U transformers"
+        ) from e
+
+    try:
+        import einops  # noqa: F401
+    except ImportError as e:
+        raise ImportError(
+            "Le module 'einops' est requis par PaddleOCR-VL (erreur 'No module named einops').\n"
+            "Installez-le avec : pip install einops"
+        ) from e
+
+    try:
+        processor = AutoProcessor.from_pretrained(PADDLEOCR_VL_PATH, trust_remote_code=True)
+        model = AutoModel.from_pretrained(
+            PADDLEOCR_VL_PATH,
+            trust_remote_code=True,
+            torch_dtype="auto",
+        )
+    except KeyError as e:
+        if "rope" in str(e).lower():
+            raise RuntimeError(
+                "Erreur de compatibilite sur 'rope_parameters' / rope_type='default'.\n"
+                "Cause : la version de 'transformers' installee ne comprend pas le format de "
+                "'rope_scaling' present dans le config.json du modele PaddleOCR-VL.\n"
+                "A faire, dans l'ordre :\n"
+                "  1) pip install -U transformers   (tester la derniere version stable)\n"
+                "  2) Si ca persiste : ouvrir le requirements.txt / README dans\n"
+                f"     {PADDLEOCR_VL_PATH}\n"
+                "     et installer EXACTEMENT la version de transformers indiquee par le "
+                "modele : pip install transformers==<version_indiquee>\n"
+                "  3) En dernier recours : ouvrir config.json du modele, verifier la cle "
+                "'rope_scaling' (ou 'rope_parameters') et l'adapter au schema attendu par "
+                "la version de transformers installee (renommage de sous-cles frequent "
+                "entre versions : 'type' <-> 'rope_type')."
+            ) from e
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Echec du chargement du modele PaddleOCR-VL : {e}") from e
+
+    model.eval()
+    _MODEL_CACHE["model"] = model
+    _MODEL_CACHE["processor"] = processor
+    return processor, model
+
+
+def ocr_vlm(image: Image.Image) -> str:
+    processor, model = get_paddleocr_vl()
+    prompt = "Extrait tout le texte visible sur ce document, tel quel, sans le traduire."
+    inputs = processor(images=image, text=prompt, return_tensors="pt")
+    sortie = model.generate(**inputs, max_new_tokens=2048)
+    return processor.batch_decode(sortie, skip_special_tokens=True)[0]
+
+
+# ==========================================================================
+# PARTIE B - PRE-TRAITEMENT IMAGE (rotation + qualite)
+# ==========================================================================
+def corriger_rotation_grossiere(image: Image.Image) -> Image.Image:
+    """Corrige une rotation de 90/180/270° via la detection d'orientation Tesseract (OSD)."""
+    try:
+        osd = pytesseract.image_to_osd(image)
+        match = re.search(r"Rotate:\s*(\d+)", osd)
+        if match:
+            angle = int(match.group(1))
+            if angle != 0:
+                image = image.rotate(-angle, expand=True)
+    except Exception:
+        # OSD peut echouer si l'image contient trop peu de texte detectable :
+        # on continue sans correction plutot que de bloquer le traitement.
+        pass
+    return image
+
+
+def corriger_inclinaison_fine(image: Image.Image) -> Image.Image:
+    """Corrige une legere inclinaison (quelques degres), frequente sur les scans papier."""
+    img_gris = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
+    _, seuil = cv2.threshold(img_gris, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    coords = np.column_stack(np.where(seuil > 0))
+    if len(coords) < 50:
+        return image  # pas assez de matiere pour estimer un angle fiable
+
+    angle = cv2.minAreaRect(coords)[-1]
+    angle = -(90 + angle) if angle < -45 else -angle
+
+    if abs(angle) < 0.5 or abs(angle) > 15:
+        return image  # angle negligeable ou probablement une fausse detection
+
+    (h, w) = img_gris.shape
+    matrice = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    img_redressee = cv2.warpAffine(
+        np.array(image), matrice, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
+    )
+    return Image.fromarray(img_redressee)
+
+
+def ameliorer_qualite(image: Image.Image) -> Image.Image:
+    """Contraste adaptatif (CLAHE) + debruitage + nettete, en conservant la couleur."""
+    img_lab = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(img_lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    img_lab = cv2.merge((l, a, b))
+    img_rgb = cv2.cvtColor(img_lab, cv2.COLOR_LAB2RGB)
+    img_rgb = cv2.fastNlMeansDenoisingColored(img_rgb, None, 5, 5, 7, 21)
+    noyau = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    img_rgb = cv2.filter2D(img_rgb, -1, noyau)
+    return Image.fromarray(img_rgb)
+
+
+def pretraiter_image(image: Image.Image) -> Image.Image:
+    image = corriger_rotation_grossiere(image)
+    image = corriger_inclinaison_fine(image)
+    image = ameliorer_qualite(image)
+    return image
+
+
+def preparer_bande_pour_tesseract(bande: Image.Image) -> Image.Image:
+    """Upscale + binarisation : la MRZ est en tres petits caracteres, Tesseract a besoin
+    d'une image agrandie et bien contrastee pour la lire correctement."""
+    img_gris = cv2.cvtColor(np.array(bande), cv2.COLOR_RGB2GRAY)
+    h, w = img_gris.shape
+    facteur = 3.0 if w < 1500 else 1.5
+    img_gris = cv2.resize(img_gris, None, fx=facteur, fy=facteur, interpolation=cv2.INTER_CUBIC)
+    img_gris = cv2.GaussianBlur(img_gris, (3, 3), 0)
+    _, img_bin = cv2.threshold(img_gris, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return Image.fromarray(img_bin)
+
+
+# ==========================================================================
+# PARTIE C - DETECTION TYPE DE DOCUMENT / NATIONALITE (bilingue AR/FR)
+# ==========================================================================
+def normaliser_recherche(texte: str) -> str:
+    texte = texte.lower()
+    texte = unicodedata.normalize("NFKD", texte)
+    return "".join(c for c in texte if not unicodedata.combining(c))
+
+
+def contient_un_des_mots_cles(texte_normalise: str, mots_cles: list[str]) -> bool:
+    return any(normaliser_recherche(m) in texte_normalise for m in mots_cles)
+
+
+MOTS_CLES_TYPE_DOCUMENT = {
+    "Carte Nationale d'Identite": [
+        "carte nationale d'identite", "carte d'identite", "cni",
+        "بطاقة التعريف الوطنية", "بطاقة تعريف وطنية",
+    ],
+    "Permis de Conduire": [
+        "permis de conduire", "رخصة السياقة", "رخصة سياقة",
+    ],
+    "Passeport": [
+        "passeport", "جواز سفر", "جواز السفر",
+    ],
+}
+
+MOTS_CLES_ALGERIE = [
+    "republique algerienne democratique et populaire",
+    "الجمهورية الجزائرية الديمقراطية الشعبية",
+    "algerienne", "algerien", "الجزائر", "جزائرية", "جزائري",
+]
+
+
+def detecter_type_document(texte_ocr: str) -> str:
+    texte_norm = normaliser_recherche(texte_ocr)
+    for type_doc, mots_cles in MOTS_CLES_TYPE_DOCUMENT.items():
+        if contient_un_des_mots_cles(texte_norm, mots_cles):
+            return type_doc
+    return "Indetermine"
+
+
+def detecter_document_algerien(texte_ocr: str) -> bool:
+    return contient_un_des_mots_cles(normaliser_recherche(texte_ocr), MOTS_CLES_ALGERIE)
+
+
+# ==========================================================================
+# PARTIE D - DETECTION MRZ HYBRIDE (VLM + bande image dediee, multi-decoupes)
+# ==========================================================================
+MRZ_LIGNE_PATTERN = re.compile(r'^[A-Z0-9<]{28,44}$')
+
+def detecter_lignes_mrz_dans_texte(texte_ocr: str) -> list[str]:
+    lignes = [l.strip().upper().replace(" ", "") for l in texte_ocr.splitlines()]
+    return [l for l in lignes if MRZ_LIGNE_PATTERN.match(l) and l.count("<") >= 2]
+
+
+# Plusieurs hauteurs de decoupe testees car les marges de scan varient d'un
+# document a l'autre (25% couvrait des cas trop stricts -> on elargit).
+DECOUPES_BANDE_MRZ = [0.60, 0.70, 0.75, 0.80]
+
+def tenter_extraire_bande_mrz(image: Image.Image) -> list[str]:
+    largeur, hauteur = image.size
+    for ratio in DECOUPES_BANDE_MRZ:
+        bande = image.crop((0, int(hauteur * ratio), largeur, hauteur))
+        bande_traitee = preparer_bande_pour_tesseract(bande)
+        config = "--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"
+        texte = pytesseract.image_to_string(bande_traitee, config=config, lang="eng")
+        lignes = [l.strip().upper().replace(" ", "") for l in texte.splitlines() if l.strip()]
+        lignes_valides = [l for l in lignes if MRZ_LIGNE_PATTERN.match(l)]
+        if len(lignes_valides) in (2, 3):
+            return lignes_valides
+    return []
+
+
+def extraire_mrz_hybride(image_pretraitee: Image.Image, texte_ocr_vlm: str) -> tuple[list[str], str]:
+    lignes_vlm = detecter_lignes_mrz_dans_texte(texte_ocr_vlm)
+    lignes_lib = tenter_extraire_bande_mrz(image_pretraitee)
+
+    if lignes_vlm and lignes_lib:
+        if len(lignes_vlm) in (2, 3):
+            return lignes_vlm, "VLM + Bibliotheque MRZ (recoupement, VLM retenu)"
+        return lignes_lib, "VLM + Bibliotheque MRZ (recoupement, Bibliotheque retenue)"
+    elif lignes_vlm:
+        return lignes_vlm, "VLM uniquement"
+    elif lignes_lib:
+        return lignes_lib, "Bibliotheque MRZ uniquement"
+    return [], "Aucune"
+
+
+# ==========================================================================
+# PARTIE E - PARSING DES CHAMPS MRZ (TD1 = CNI, TD3 = passeport)
+# ==========================================================================
+def formater_date_mrz(date_aaMMjj: str) -> str:
+    if not date_aaMMjj or len(date_aaMMjj) != 6 or not date_aaMMjj.isdigit():
+        return ""
+    aa, mm, jj = date_aaMMjj[0:2], date_aaMMjj[2:4], date_aaMMjj[4:6]
+    siecle = "20" if int(aa) <= 30 else "19"
+    return f"{jj}/{mm}/{siecle}{aa}"
+
+
+def traduire_sexe(code: str) -> str:
+    return {"M": "Masculin", "F": "Feminin"}.get(code, "Indetermine")
+
+
+def parser_mrz(lignes: list[str]) -> dict:
+    try:
+        if len(lignes) == 3 and all(len(l) >= 28 for l in lignes):
+            from mrz.checker.td1 import TD1CodeChecker
+            texte_mrz = "\n".join(l[:30].ljust(30, "<") for l in lignes)
+            checker = TD1CodeChecker(texte_mrz)
+            champs, format_mrz = checker.fields(), "TD1 (carte d'identite)"
+        elif len(lignes) == 2 and all(len(l) >= 40 for l in lignes):
+            from mrz.checker.td3 import TD3CodeChecker
+            texte_mrz = "\n".join(l[:44].ljust(44, "<") for l in lignes)
+            checker = TD3CodeChecker(texte_mrz)
+            champs, format_mrz = checker.fields(), "TD3 (passeport)"
+        else:
+            return {"erreur_parsing_mrz": f"Nombre/longueur de lignes inattendu ({len(lignes)})"}
+
+        return {
+            "format_mrz": format_mrz,
+            "mrz_valide": bool(checker),
+            "nom": getattr(champs, "surname", ""),
+            "prenom": getattr(champs, "name", ""),
+            "numero_document": getattr(champs, "document_number", ""),
+            "date_naissance": formater_date_mrz(getattr(champs, "birth_date", "")),
+            "sexe": traduire_sexe(getattr(champs, "sex", "")),
+            "date_expiration": formater_date_mrz(getattr(champs, "expiry_date", "")),
+            "nationalite": getattr(champs, "nationality", ""),
+            "pays_emetteur": getattr(champs, "country", ""),
+        }
+    except Exception as e:
+        return {"erreur_parsing_mrz": str(e)}
+
+
+# ==========================================================================
+# PARTIE F - TRAITEMENT PAR CLIENT
+# ==========================================================================
+@dataclass
+class ResultatIdentite:
+    client_id: str
+    fichier_trouve: bool = False
+    nb_pages: int = 0
+    type_document: str = "Non traite"
+    document_algerien: str = "Indetermine"
+    biometrique: str = "Non"
+    mrz_detectee: str = "Non"
+    methode_mrz: str = "Aucune"
+    page_mrz: int = 0
+    mrz_brute: str = ""
+    informations_mrz: dict = field(default_factory=dict)
+    erreur: str = ""
+
+
+def pdf_vers_images(pdf_path: Path, dpi: int = DPI_CONVERSION) -> list[Image.Image]:
+    doc = fitz.open(pdf_path)
+    zoom = dpi / 72
+    matrice = fitz.Matrix(zoom, zoom)
+    images = []
+    for page in doc:
+        pix = page.get_pixmap(matrix=matrice)
+        images.append(Image.frombytes("RGB", [pix.width, pix.height], pix.samples))
+    doc.close()
+    return images
+
+
+def traiter_client(dossier_client: Path) -> ResultatIdentite:
+    client_id = dossier_client.name
+    resultat = ResultatIdentite(client_id=client_id)
+
+    pdf_path = dossier_client / NOM_FICHIER_IDENTITE
+    if not pdf_path.exists():
+        resultat.erreur = "JUSTIFICATIF IDENTITE.pdf absent"
+        return resultat
+
+    resultat.fichier_trouve = True
+
+    try:
+        images_brutes = pdf_vers_images(pdf_path)
+        resultat.nb_pages = len(images_brutes)
+
+        texte_toutes_pages = []
+        lignes_mrz_trouvees: list[str] = []
+        methode_mrz_retenue = "Aucune"
+        numero_page_mrz = 0
+
+        for i, image_brute in enumerate(images_brutes, start=1):
+            # Pre-traitement systematique : rotation + qualite, AVANT tout OCR
+            image_prete = pretraiter_image(image_brute)
+
+            if SAUVEGARDER_IMAGES_DEBUG:
+                DOSSIER_DEBUG.mkdir(exist_ok=True)
+                image_prete.save(DOSSIER_DEBUG / f"{client_id}_page{i}.jpg")
+
+            texte_page = ocr_vlm(image_prete)
+            texte_toutes_pages.append(texte_page)
+
+            if not lignes_mrz_trouvees:
+                lignes, methode = extraire_mrz_hybride(image_prete, texte_page)
+                if lignes:
+                    lignes_mrz_trouvees = lignes
+                    methode_mrz_retenue = methode
+                    numero_page_mrz = i
+
+        texte_complet = "\n".join(texte_toutes_pages)
+        resultat.type_document = detecter_type_document(texte_complet)
+        resultat.document_algerien = "Oui" if detecter_document_algerien(texte_complet) else "Non"
+
+        if lignes_mrz_trouvees:
+            resultat.mrz_detectee = "Oui"
+            resultat.methode_mrz = methode_mrz_retenue
+            resultat.page_mrz = numero_page_mrz
+            resultat.mrz_brute = " | ".join(lignes_mrz_trouvees)
+            resultat.biometrique = "Oui"
+            resultat.informations_mrz = parser_mrz(lignes_mrz_trouvees)
+        else:
+            resultat.biometrique = "Non"
+
+    except Exception as e:
+        resultat.erreur = f"Erreur de traitement : {e}"
+
+    return resultat
+
+
+# ==========================================================================
+# PARTIE G - MAIN : parcours de tous les clients + rapports
+# ==========================================================================
+def main():
+    dossiers_clients = sorted([p for p in DOCUMENTS_DIR.iterdir() if p.is_dir()])
+    print(f"[INFO] {len(dossiers_clients)} dossier(s) client (complets) a traiter.")
+
+    resultats = []
+    for dossier in dossiers_clients:
+        print(f"[TRAITEMENT] {dossier.name} ...")
+        resultats.append(traiter_client(dossier))
+
+    with open(RAPPORT_DETAIL, "w", newline="", encoding="utf-8-sig") as f:
+        colonnes = [
+            "client_id", "fichier_trouve", "nb_pages", "type_document",
+            "document_algerien", "biometrique", "mrz_detectee", "methode_mrz",
+            "page_mrz", "mrz_brute", "informations_mrz", "erreur",
+        ]
+        writer = csv.DictWriter(f, fieldnames=colonnes, delimiter=";")
+        writer.writeheader()
+        for r in resultats:
+            ligne = asdict(r)
+            ligne["informations_mrz"] = json.dumps(r.informations_mrz, ensure_ascii=False)
+            writer.writerow(ligne)
+
+    with open(RAPPORT_MRZ, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f, delimiter=";")
+        writer.writerow(["client_id", "mrz_detectee", "methode_mrz", "page_mrz", "type_document", "raison_absence"])
+        for r in resultats:
+            raison = ""
+            if r.mrz_detectee != "Oui":
+                if not r.fichier_trouve:
+                    raison = "Fichier JUSTIFICATIF IDENTITE.pdf absent"
+                elif r.erreur:
+                    raison = r.erreur
+                elif r.type_document == "Permis de Conduire":
+                    raison = "Document generalement non biometrique"
+                else:
+                    raison = "MRZ non detectee malgre pretraitement (qualite scan / verso manquant / doc ancien format)"
+            writer.writerow([r.client_id, r.mrz_detectee, r.methode_mrz, r.page_mrz, r.type_document, raison])
+
+    total = len(resultats)
+    avec_mrz = sum(1 for r in resultats if r.mrz_detectee == "Oui")
+    print(f"[OK] Rapport detaille : {RAPPORT_DETAIL.resolve()}")
+    print(f"[OK] Rapport MRZ      : {RAPPORT_MRZ.resolve()}")
+    print(f"[RESUME] {avec_mrz}/{total} clients avec MRZ extraite, {total - avec_mrz}/{total} sans MRZ.")
+
+
+if __name__ == "__main__":
+    main()
